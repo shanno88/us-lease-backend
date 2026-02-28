@@ -2,7 +2,6 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pathlib import Path
 import time
-import pdfplumber
 import logging
 import uuid
 import json
@@ -505,7 +504,9 @@ async def analyze_lease(
 ):
     start_time = time.time()
     temp_image_paths = []
-    MAX_PAGES = 40
+
+    if len(files) > 3:
+        raise HTTPException(status_code=400, detail="Maximum 3 images allowed")
 
     if not await has_valid_paid_access(user_id):
         logger.warning(f"Access denied for user_id: {user_id}")
@@ -522,7 +523,6 @@ async def analyze_lease(
         pdf_service = get_pdf_service()
         ocr_service = get_ocr_service()
         all_image_paths = []
-        all_texts = []
 
         sorted_files = sorted(files, key=lambda f: f.filename or "")
 
@@ -531,37 +531,17 @@ async def analyze_lease(
             uploaded_path = Path(uploaded_file_path)
             temp_image_paths.append(uploaded_file_path)
 
-            if pdf_service.is_pdf(uploaded_path):
-                logger.info(f"Processing PDF with pdfplumber: {file.filename}")
-                try:
-                    with pdfplumber.open(uploaded_path) as pdf:
-                        for page in pdf.pages:
-                            text = page.extract_text()
-                            if text:
-                                all_texts.append(text)
-                    logger.info(f"Extracted text from {len(all_texts)} pages via pdfplumber")
-                except Exception as e:
-                    logger.error(f"pdfplumber failed: {e}, falling back to OCR")
-                    image_paths = pdf_service.pdf_to_images(uploaded_path)
-                    all_image_paths.extend(image_paths)
-                    temp_image_paths.extend(image_paths)
-            elif pdf_service.is_image(uploaded_path):
+            if pdf_service.is_image(uploaded_path):
                 logger.info(f"Processing image file: {file.filename}")
                 all_image_paths.append(uploaded_path)
             else:
-                raise HTTPException(status_code=400, detail=f"Unsupported file format: {uploaded_path.suffix}")
+                raise HTTPException(status_code=400, detail=f"Unsupported file format: {uploaded_path.suffix}. Only image files (JPG/PNG) are allowed.")
 
-        if all_texts:
-            # PDF text extraction succeeded - skip OCR entirely
-            full_text = "\n\n".join(all_texts)
-            ocr_result = {"lines": [], "page_count": len(all_texts)}
-            logger.info(f"Using pdfplumber text: {len(full_text)} chars")
-        elif all_image_paths:
-            # Image files - use OCR
-            ocr_result = ocr_service.recognize_images(all_image_paths)
-            full_text = ocr_result.get("full_text", "")
-        else:
-            raise HTTPException(status_code=400, detail="No pages found in the document(s)")
+        if not all_image_paths:
+            raise HTTPException(status_code=400, detail="No valid image files found.")
+
+        ocr_result = ocr_service.recognize_images(all_image_paths)
+        full_text = ocr_result.get("full_text", "")
 
         if not full_text or not full_text.strip():
             return {"success": False, "error": "No text extracted from document."}
