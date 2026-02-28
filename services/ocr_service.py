@@ -322,6 +322,11 @@ Remember: Output ONLY raw JSON, no markdown, no explanations. Fill ALL fields if
             max_tokens=3000,
         )
         raw_content = response.choices[0].message.content or ""
+
+        print("===== RAW LLM RESPONSE START =====", flush=True)
+        print(raw_content[:2000], flush=True)
+        print("===== RAW LLM RESPONSE END =====", flush=True)
+
         logger.info(f"[DIAGNOSTIC] === LLM RESPONSE ===")
         logger.info(f"[DIAGNOSTIC] LLM response length: {len(raw_content)} chars")
         logger.info(f"[DIAGNOSTIC] LLM response raw: {raw_content}")
@@ -396,6 +401,19 @@ Remember: Output ONLY raw JSON, no markdown, no explanations. Fill ALL fields if
                 f"[DIAGNOSTIC] FIRST CLAUSE: category={first_clause.get('category')}, "
                 f"title_en={first_clause.get('title_en')}, summary_zh={first_clause.get('summary_zh')}"
             )
+
+        print("===== FINAL LEASE_DATA START =====", flush=True)
+        print("keys:", list(result.keys()), flush=True)
+        print("risk_score:", result.get("risk_score"), flush=True)
+        print("risk_level:", result.get("risk_level"), flush=True)
+        print("clauses count:", len(result.get("clauses") or []), flush=True)
+        if result.get("clauses"):
+            first_clause = result["clauses"][0]
+            print("first clause sample:", first_clause, flush=True)
+        else:
+            print("NO CLAUSES in result!", flush=True)
+        print("===== FINAL LEASE_DATA END =====", flush=True)
+
         return result
     except json.JSONDecodeError as e:
         logger.error(f"[DEEPSEEK] JSON decode error: {e}")
@@ -517,7 +535,7 @@ class OCRService:
             "success": True,
             "data": {
                 "analysis_id": str(uuid.uuid4()),
-                "has_full_access": False,
+                "has_full_access": True,  # TEST MODE: always unlocked
                 "risk_score": lease_data["risk_score"],
                 "risk_level": lease_data["risk_level"],
                 "red_flags": lease_data["red_flags"],

@@ -30,17 +30,13 @@ class Settings(BaseSettings):
     PADDLE_API_KEY: str = ""
     PADDLE_WEBHOOK_SECRET: str = ""
 
-    # DeepSeek（老版本用这个）
+    # DeepSeek API (primary LLM for all analysis)
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_MODEL: str = "deepseek-chat"
 
     # Qwen OCR via DashScope (Alibaba Cloud)
     DASHSCOPE_API_KEY: str = ""
     QWEN_VL_MODEL: str = "qwen-vl-ocr"
-
-    # DeepInfra（现在保留做实验用）
-    DEEPINFRA_API_KEY: str = ""
-    DEEPINFRA_MODEL: str = "meta-llama/Llama-3.2-3B-Instruct"
 
     # Test mode
     TEST_USER_BYPASS: bool = False

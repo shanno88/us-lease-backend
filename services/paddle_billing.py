@@ -136,7 +136,7 @@ class PaddleClient:
                 "timestamp": datetime.utcnow().isoformat(),
             },
             "settings": {
-                "display_name": "QiYoga Studio - 30-Day Unlimited Access",
+                "display_name": "TutorBox - 30-Day Unlimited Access",
                 "success_url": f"{self.config.frontend_url}/#/billing/success?user_id={user_id}",
                 "cancel_url": f"{self.config.frontend_url}/#/pricing",
             },

@@ -2,15 +2,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from routes import lease_routes, billing_routes
+from routes import lease_router, billing_router
 
 app = FastAPI(
-    title="QiYoga Lease OCR API",
+    title="TutorBox Lease OCR API",
     description="API for analyzing lease agreements using OCR",
     version="1.0.0",
 )
 
-# CORS配置
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,15 +18,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 修复：路由注册时指定前缀
-app.include_router(lease_routes.router, prefix="/api/lease", tags=["lease"])
-app.include_router(billing_routes.router, prefix="/api/billing", tags=["billing"])
+app.include_router(lease_router, prefix="/api/lease")
+app.include_router(billing_router, prefix="/api/billing")
 
 
 @app.get("/")
 async def root():
     return {
-        "message": "QiYoga Lease OCR API is running",
+        "message": "TutorBox Lease OCR API is running",
         "version": "1.0.0",
         "endpoints": {
             "analyze": "/api/lease/analyze",

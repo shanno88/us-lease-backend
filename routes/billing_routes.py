@@ -12,7 +12,7 @@ from services.paddle import (
     parse_webhook_event,
     PAYMENT_SUCCESS_EVENTS,
 )
-from routes.lease_routes import USER_ACCESS_STORE
+from store import USER_ACCESS_STORE, ANALYSIS_STORE
 
 logger = logging.getLogger(__name__)
 
@@ -448,8 +448,6 @@ async def check_user_access(
 async def check_payment_status(analysis_id: str):
     """Legacy endpoint for backward compatibility"""
     try:
-        from routes.lease_routes import ANALYSIS_STORE
-
         if analysis_id not in ANALYSIS_STORE:
             raise HTTPException(status_code=404, detail="Analysis not found")
 

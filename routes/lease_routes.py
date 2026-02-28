@@ -6,6 +6,7 @@ import logging
 import uuid
 import json
 import random
+import re
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, timedelta
 from openai import OpenAI
@@ -18,12 +19,37 @@ from utils.text_parser import (
     build_key_info_from_summary,
     filter_and_extract_high_risk_clauses,
 )
-from services.ocr_service import get_ocr_service
+from services.ocr_service import get_ocr_service, analyze_lease_via_deepseek
 from services.pdf_service import get_pdf_service
+from store import (
+    USER_ACCESS_STORE,
+    USER_FREE_ANALYSIS_STORE,
+    ANALYSIS_STORE,
+    QUICK_ANALYZE_RATE_LIMITS,
+    IP_RATE_LIMITS,
+    QUICK_CLAUSE_HISTORY,
+    QUICK_ANALYZE_USER_LIMIT,
+    QUICK_ANALYZE_IP_LIMIT,
+    QUICK_ANALYZE_WINDOW,
+    FULL_ANALYSIS_LEASE_LIMIT,
+    QUICK_CLAUSE_HISTORY_LIMIT,
+)
 
 logger = logging.getLogger(__name__)
 
+router = APIRouter(tags=["lease"])
+
 _deepseek_client = None
+
+
+def has_valid_paid_access(user_id: str) -> bool:
+    if user_id not in USER_ACCESS_STORE:
+        return False
+    access = USER_ACCESS_STORE[user_id]
+    if "expires_at" not in access:
+        return False
+    expires_at = datetime.fromisoformat(access["expires_at"])
+    return datetime.now() < expires_at
 
 
 def get_deepseek_client() -> OpenAI:
@@ -148,30 +174,159 @@ Extract the following fields from the lease document. Return ONLY valid JSON wit
   "overall_risk": "<low|medium|high>"
 }
 
-FIELD RULES
-- monthly_rent_amount: Extract the numeric monthly rent (e.g., 685). If only weekly/annual given, convert to monthly. Look for patterns like "Rent: $685/month", "Monthly Rent: 685", "Base Rent: $685".
-- currency: Usually "USD" for US leases
-- lease_start_date: Format as YYYY-MM-DD. Convert "July 1, 2012" to "2012-07-01". Look for "Commencement Date", "Start Date", "Effective Date", "begins on".
-- lease_end_date: Format as YYYY-MM-DD. Look for "Expiration Date", "End Date", "terminates on", "ends on".
-- lease_duration_months: Calculate from dates if not explicitly stated. 12 months = 1 year. Look for "term of 12 months", "one year lease", "12-month term".
-- security_deposit_amount: Usually equals 1 month rent, but extract actual value if stated. Look for "Security Deposit", "Deposit", "refundable deposit".
-- landlord_name: Full name or company name of landlord/lessor. Look for "Landlord:", "Lessor:", "Owner:", after "between" clauses.
-- tenant_name: Full name of tenant/lessee. Look for "Tenant:", "Lessee:", "Renter:", after "between" clauses.
-- late_fee_summary_zh: Example: "滞纳金为每日5美元，从到期日后第5天开始计算"
-- early_termination_risk_zh: Example: "提前解约需支付2个月租金作为违约金" or warn if clause is missing
-- overall_risk: "low"=standard lease, "medium"=some concerning terms, "high"=significant risks
+Return ONLY valid JSON, no markdown, no explanations."""
 
-RULES
-1. Return ONLY valid JSON, no markdown or explanations
-2. Use null for fields not found in the document - DO NOT use "N/A", "Not found", or empty strings
-3. Be precise with dates and numbers - extract actual values from the text
-4. Chinese summaries should be natural and concise (1 sentence each)
-5. Calculate overall_risk based on: deposit amount, termination terms, fee structures
-6. CRITICAL: Always extract landlord_name and tenant_name from signature blocks or party identification sections
-7. For rent and deposit amounts, extract ONLY the numeric value (no $ sign, no currency symbol)"""
+
+KEY_CLAUSES_EXTRACTION_PROMPT = """You are a lease clause analyzer. Extract and analyze key clauses from the lease text.
+
+YOUR TASK
+Identify 5-10 of the most important clauses in this lease. For each clause, provide ALL fields in a single object.
+
+OUTPUT FORMAT (STRICT JSON ARRAY)
+Return a JSON array where each object has EXACTLY these fields:
+
+[
+  {
+    "clause_id": "Clause 1",
+    "clause_text_en": "The exact English text from the lease (max 300 chars)",
+    "summary_zh": "Specific Chinese explanation of what this clause means and its impact on the tenant (2-3 sentences)",
+    "risk_level": "low"
+  },
+  ...
+]
+
+RISK LEVEL RULES
+- "low": Standard, tenant-friendly, or no significant concerns
+- "medium": Some concerns, additional costs, or restrictions
+- "high": Significant risk, unusual terms, or heavily favors landlord
+
+SUMMARY_ZH RULES
+- MUST be specific to THIS clause, not generic filler
+- MUST describe what the clause regulates and its impact on tenant
+- Include specific amounts, dates, or conditions when present
+- NEVER use generic phrases like "该条款已分析潜在问题" or "这是标准条款"
+
+CLAUSE_TEXT_EN RULES
+- MUST be actual English text from the lease
+- NEVER use "1", "2", "3" or any placeholder
+- If text is longer than 300 chars, truncate but keep it meaningful
+
+IMPORTANT CLAUSES TO LOOK FOR
+1. Lease term (dates, duration)
+2. Rent amount and payment terms
+3. Security deposit
+4. Late fees
+5. Early termination / break lease
+6. Utilities responsibility
+7. Maintenance and repairs
+8. Pet policy
+9. Guest policy
+10. Landlord entry rights
+11. Subletting rules
+12. Rent increase terms
+
+Return ONLY the JSON array, no markdown, no explanations."""
+
+
+def remove_duplicate_sentences(text: str) -> str:
+    """Remove consecutive duplicate sentences from Chinese text."""
+    if not text or not text.strip():
+        return text
+
+    sentences = re.split(r"([。！？\n])", text)
+    cleaned = []
+    prev_sentence = ""
+
+    for i, part in enumerate(sentences):
+        if part in "。！？\n":
+            if cleaned and prev_sentence:
+                cleaned.append(part)
+            prev_sentence = ""
+        else:
+            part_stripped = part.strip()
+            if part_stripped and part_stripped != prev_sentence:
+                cleaned.append(part)
+                prev_sentence = part_stripped
+
+    return "".join(cleaned).strip()
+
+
+async def extract_lease_summary_llm(full_text: str) -> Dict[str, Any]:
+    """
+    Extract structured lease summary using LLM.
+    Returns a dict with monthly_rent_amount, currency, dates, etc.
+    """
+    if not full_text or not full_text.strip():
+        return {}
+
+    try:
+        logger.info(f"[LLM SUMMARY] Starting extraction for {len(full_text)} chars")
+
+        response = get_deepseek_client().chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": LEASE_SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": full_text[:8000]},
+            ],
+            temperature=0.1,
+            max_tokens=800,
+        )
+
+        raw_content = response.choices[0].message.content or "{}"
+        logger.info(f"[LLM SUMMARY] Raw LLM response: {raw_content[:500]}")
+
+        clean = raw_content.strip()
+        if clean.startswith("```json"):
+            clean = clean[7:]
+        elif clean.startswith("```"):
+            clean = clean.split("\n", 1)[1] if "\n" in clean else clean
+        if clean.endswith("```"):
+            clean = clean.rsplit("```", 1)[0]
+        clean = clean.strip()
+
+        parsed = json.loads(clean)
+        logger.info(
+            f"[LLM SUMMARY] Parsed JSON: {json.dumps(parsed, indent=2, ensure_ascii=False)}"
+        )
+        return parsed
+
+    except json.JSONDecodeError as e:
+        logger.error(f"[LLM SUMMARY] JSON parse error: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"[LLM SUMMARY] Extraction failed: {e}")
+        return {}
+
+
+async def get_chinese_explanation(english_text: str) -> Optional[str]:
+    """Get Chinese explanation for English text."""
+    if not english_text or not english_text.strip():
+        return None
+
+    try:
+        response = get_deepseek_client().chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": BILINGUAL_EXPLAINER_SYSTEM_PROMPT},
+                {"role": "user", "content": english_text},
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+
+        result = response.choices[0].message.content or ""
+        parsed = parse_bilingual_response(result)
+
+        if parsed:
+            return parsed[0].get("chinese_explanation", "")
+        return None
+    except Exception as e:
+        logger.error(f"DeepSeek error in get_chinese_explanation: {e}")
+        return None
 
 
 def parse_bilingual_response(response_text: str) -> List[Dict[str, str]]:
+    """Parse bilingual response from AI."""
     clauses = []
     blocks = [b.strip() for b in response_text.split("\n\n") if b.strip()]
 
@@ -194,55 +349,33 @@ def parse_bilingual_response(response_text: str) -> List[Dict[str, str]]:
     return clauses
 
 
-async def get_chinese_explanation(english_text: str) -> Optional[str]:
-    try:
-        response = get_deepseek_client().chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": BILINGUAL_EXPLAINER_SYSTEM_PROMPT},
-                {"role": "user", "content": english_text},
-            ],
-            temperature=0.3,
-            max_tokens=1000,
-        )
-
-        result = response.choices[0].message.content or ""
-        parsed = parse_bilingual_response(result)
-
-        if parsed:
-            return parsed[0]["chinese_explanation"]
-        return None
-    except Exception as e:
-        logger.error(f"DeepSeek error in get_chinese_explanation: {e}")
-        return None
-
-
-async def extract_lease_summary_llm(full_text: str) -> Dict[str, Any]:
+async def extract_key_clauses_from_lease(full_text: str) -> List[Dict[str, Any]]:
     """
-    Extract structured lease summary using LLM.
-    Returns a dict with monthly_rent_amount, currency, dates, etc.
-    This function does NOT modify any existing code paths.
+    Extract key clauses from lease text using a SINGLE AI call.
+    Returns clauses with: clause_id, clause_text_en, summary_zh, risk_level
     """
-    raw_content = ""
+    if not full_text or not full_text.strip():
+        logger.warning("[KEY_CLAUSES] Empty full_text provided")
+        return []
+
     try:
-        logger.info(f"[LLM SUMMARY] Starting extraction for {len(full_text)} chars")
-        logger.info(f"[LLM SUMMARY] First 500 chars of input: {full_text[:500]}")
+        logger.info(f"[KEY_CLAUSES] Extracting clauses from {len(full_text)} chars")
 
         response = get_deepseek_client().chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": LEASE_SUMMARY_SYSTEM_PROMPT},
-                {"role": "user", "content": full_text[:8000]},
+                {"role": "system", "content": KEY_CLAUSES_EXTRACTION_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Extract key clauses from this lease:\n\n{full_text[:6000]}",
+                },
             ],
             temperature=0.1,
-            max_tokens=800,
+            max_tokens=4000,
         )
 
-        raw_content = response.choices[0].message.content or "{}"
-        logger.info(
-            f"[LLM SUMMARY] Raw LLM response (first 500 chars): {raw_content[:500]}"
-        )
-        logger.info(f"[LLM SUMMARY] Raw LLM response (full): {raw_content}")
+        raw_content = response.choices[0].message.content or "[]"
+        logger.info(f"[KEY_CLAUSES] Raw AI response: {raw_content[:500]}")
 
         clean = raw_content.strip()
         if clean.startswith("```json"):
@@ -253,351 +386,67 @@ async def extract_lease_summary_llm(full_text: str) -> Dict[str, Any]:
             clean = clean.rsplit("```", 1)[0]
         clean = clean.strip()
 
-        logger.info(f"[LLM SUMMARY] Cleaned JSON string: {clean}")
-
         parsed = json.loads(clean)
-        logger.info(
-            f"[LLM SUMMARY] Parsed JSON: {json.dumps(parsed, indent=2, ensure_ascii=False)}"
-        )
 
-        for key in [
-            "monthly_rent_amount",
-            "security_deposit_amount",
-            "lease_duration_months",
-            "landlord_name",
-            "tenant_name",
-            "lease_start_date",
-            "lease_end_date",
-        ]:
-            value = parsed.get(key)
-            if value is None or value == "" or value == "N/A" or value == "Not found":
-                logger.warning(
-                    f"[LLM SUMMARY] Field '{key}' has missing/invalid value: {value}"
-                )
-            else:
-                logger.info(
-                    f"[LLM SUMMARY] Field '{key}' extracted successfully: {value}"
-                )
+        if not isinstance(parsed, list):
+            logger.error(f"[KEY_CLAUSES] Expected list, got {type(parsed)}")
+            return []
 
-        return parsed
+        clauses = []
+        for idx, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                continue
+
+            clause_text_en = str(item.get("clause_text_en", "")).strip()
+
+            # Skip if clause_text_en is invalid (just numbers, too short, or placeholder)
+            if not clause_text_en or len(clause_text_en) < 20:
+                continue
+            if clause_text_en.isdigit() or clause_text_en in ["1", "2", "3", "4", "5"]:
+                continue
+            if clause_text_en.lower() in ["clause", "section", "page"]:
+                continue
+
+            risk_level = str(item.get("risk_level", "medium")).lower()
+            if risk_level not in ["low", "medium", "high"]:
+                risk_level = "medium"
+
+            clause = {
+                "clause_id": str(item.get("clause_id") or f"Clause {idx + 1}"),
+                "clause_text_en": clause_text_en[:500],  # Limit length
+                "summary_zh": str(item.get("summary_zh", ""))[:500],
+                "risk_level": risk_level,
+            }
+            clauses.append(clause)
+
+        logger.info(f"[KEY_CLAUSES] Extracted {len(clauses)} valid clauses")
+        return clauses
 
     except json.JSONDecodeError as e:
-        logger.error(f"[LLM SUMMARY] JSON parse error: {e}")
-        logger.error(
-            f"[LLM SUMMARY] Raw content that failed: {raw_content[:1000] if raw_content else 'empty'}"
-        )
-        return {}
-    except Exception as e:
-        logger.error(f"[LLM SUMMARY] Extraction failed: {e}")
-        return {}
-
-
-# In-memory storage for analysis results
-ANALYSIS_STORE: Dict[str, Dict[str, Any]] = {}
-USER_ACCESS_STORE: Dict[str, Dict[str, Any]] = {}
-USER_FREE_ANALYSIS_STORE: Dict[str, bool] = {}
-
-# Rate limiting storage for quick-analyze endpoint
-QUICK_ANALYZE_RATE_LIMITS: Dict[str, List[datetime]] = {}
-IP_RATE_LIMITS: Dict[str, List[datetime]] = {}
-
-# Quick clause history storage (user_id -> list of results)
-QUICK_CLAUSE_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
-QUICK_CLAUSE_HISTORY_LIMIT = 3
-
-# Rate limiting constants
-QUICK_ANALYZE_USER_LIMIT = 3
-QUICK_ANALYZE_IP_LIMIT = 20
-QUICK_ANALYZE_WINDOW = timedelta(hours=24)
-
-# Full lease analysis pass constants
-FULL_ANALYSIS_LEASE_LIMIT = 5  # Max 5 leases per 30-day pass
-FULL_ANALYSIS_ACCESS_DURATION = timedelta(days=30)  # 30-day access window
-
-
-async def get_chinese_explanation_batch(texts: List[str]) -> List[str]:
-    """
-    Get Chinese explanations for multiple texts in a single AI call.
-    Returns a list of Chinese explanations in the same order as input texts.
-    """
-    if not texts:
+        logger.error(f"[KEY_CLAUSES] JSON decode error: {e}")
         return []
-
-    combined_input = "\n\n".join(texts)
-
-    try:
-        response = get_deepseek_client().chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": BILINGUAL_EXPLAINER_SYSTEM_PROMPT},
-                {"role": "user", "content": combined_input},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-        )
-
-        result = response.choices[0].message.content or ""
-        parsed = parse_bilingual_response(result)
-
-        explanations = []
-        for i, text in enumerate(texts):
-            if i < len(parsed):
-                explanations.append(parsed[i].get("chinese_explanation", ""))
-            else:
-                explanations.append("")
-
-        return explanations
     except Exception as e:
-        logger.error(f"DeepSeek error in get_chinese_explanation_batch: {e}")
-        return [""] * len(texts)
-
-
-async def get_bilingual_analysis_batch(
-    clause_data: List[Dict[str, str]],
-) -> List[Dict[str, Any]]:
-    """
-    Get bilingual analysis and suggestion for multiple clauses in a single AI call.
-    Input: list of dicts with 'clause_text' and 'risk_level' keys
-    Returns: list of dicts with analysis_en, analysis_zh, suggestion_en, suggestion_zh
-    """
-    if not clause_data:
+        logger.error(f"[KEY_CLAUSES] Extraction failed: {e}")
         return []
-
-    combined_input = ""
-    for i, clause in enumerate(clause_data):
-        combined_input += f"""---CLAUSE---
-{clause.get("clause_text", "")}
----RISK---
-{clause.get("risk_level", "safe")}
----END---
-
-"""
-
-    try:
-        response = get_deepseek_client().chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": BILINGUAL_ANALYSIS_SYSTEM_PROMPT},
-                {"role": "user", "content": combined_input},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-        )
-
-        result = response.choices[0].message.content or ""
-
-        # Try to parse JSON response
-        try:
-            # Remove potential markdown code blocks
-            clean_result = result.strip()
-            if clean_result.startswith("```"):
-                clean_result = (
-                    clean_result.split("\n", 1)[1]
-                    if "\n" in clean_result
-                    else clean_result
-                )
-            if clean_result.endswith("```"):
-                clean_result = clean_result.rsplit("```", 1)[0]
-            clean_result = clean_result.strip()
-
-            parsed = json.loads(clean_result)
-            if isinstance(parsed, list):
-                results = []
-                for item in parsed:
-                    if isinstance(item, dict):
-                        if item.get("skip"):
-                            results.append({"_skip": True})
-                        else:
-                            results.append(item)
-                    else:
-                        results.append({})
-                return results
-            elif isinstance(parsed, dict):
-                if parsed.get("skip"):
-                    return [{"_skip": True}]
-                return [parsed]
-        except json.JSONDecodeError:
-            logger.error(f"Failed to parse AI response as JSON: {result[:200]}")
-
-        # Fallback: return empty dicts
-        return [{}] * len(clause_data)
-    except Exception as e:
-        logger.error(f"DeepSeek error in get_bilingual_analysis_batch: {e}")
-        return [{}] * len(clause_data)
-
-
-router = APIRouter(tags=["lease"])
-
-
-def classify_clause(clause_text: str) -> str:
-    """
-    Classify a clause into 'meta', 'core_term', or 'other'.
-    """
-    text_lower = clause_text.lower()
-
-    # Meta: titles, headers, page markers, party names, dates
-    meta_patterns = [
-        "--- page",
-        "sample rental agreement",
-        "residential lease agreement",
-        "this agreement made this",
-        "this lease agreement",
-        "between the parties",
-        "landlord:",
-        "tenant:",
-        "lessee:",
-        "lessor:",
-        "date:",
-        "property address:",
-        "page ",
-        "section",
-    ]
-
-    for pattern in meta_patterns:
-        if pattern in text_lower:
-            # Additional check: if very short and looks like a header
-            if len(clause_text) < 50 and (
-                clause_text.strip().startswith("---")
-                or "page" in text_lower
-                or clause_text.strip().endswith(":")
-            ):
-                return "meta"
-            # Check if it's primarily a title/header
-            if (
-                any(p in text_lower for p in ["agreement", "lease", "contract"])
-                and len(clause_text) < 100
-            ):
-                return "meta"
-
-    # Core terms: important economic/legal terms
-    core_term_keywords = [
-        "rent",
-        "deposit",
-        "security deposit",
-        "late fee",
-        "term",
-        "lease term",
-        "utilities",
-        "maintenance",
-        "repair",
-        "termination",
-        "eviction",
-        "sublet",
-        "sublease",
-        "pet",
-        "guest",
-        "occupant",
-        "parking",
-        "insurance",
-        "entry",
-        "access",
-        "notice",
-        "renewal",
-        "break lease",
-        "early termination",
-        "grace period",
-        "payment",
-        "monthly",
-        "annual",
-        "yearly",
-        "prorate",
-        "pro-rate",
-    ]
-
-    for keyword in core_term_keywords:
-        if keyword in text_lower:
-            return "core_term"
-
-    return "other"
 
 
 async def generate_sample_clauses(
     full_text: str, fast_mode: bool = False
 ) -> Tuple[List[Dict[str, Any]], float]:
-    """Generate sample clause analyses from the lease text with bilingual analysis and Chinese explanations
-
-    Args:
-        full_text: The lease text to analyze
-        fast_mode: If True, generates only 3 clauses with simplified analysis (for preview mode)
+    """
+    Generate clause analyses from the lease text.
+    Simple, direct mapping: ONE AI call -> direct field mapping.
 
     Returns:
         Tuple of (clauses list, ai_duration in seconds)
     """
     ai_start_time = time.time()
-    paragraphs = [p.strip() for p in full_text.split("\n\n") if p.strip()]
 
-    if len(paragraphs) < 5:
-        sentences = [s.strip() for s in full_text.split(".") if s.strip()]
-        paragraphs = sentences
+    clauses = await extract_key_clauses_from_lease(full_text)
 
-    if fast_mode:
-        num_clauses = min(len(paragraphs), 3)
-    else:
-        num_clauses = min(len(paragraphs), random.randint(15, 20))
-
-    risk_levels = ["safe", "caution", "danger"]
-    risk_weights = [0.5, 0.35, 0.15]
-
-    clause_data_for_analysis = []
-    clause_texts_for_explanation = []
-
-    for i in range(num_clauses):
-        paragraph_idx = i % len(paragraphs)
-        clause_text = paragraphs[paragraph_idx][:200]
-        risk_level = random.choices(risk_levels, weights=risk_weights)[0]
-        category = classify_clause(clause_text)
-
-        clause_data_for_analysis.append(
-            {
-                "clause_text": clause_text,
-                "risk_level": risk_level,
-                "category": category,
-                "clause_number": i + 1,
-            }
-        )
-        clause_texts_for_explanation.append(clause_text)
-
-    # Get bilingual analysis/suggestion from AI
-    bilingual_analyses = await get_bilingual_analysis_batch(clause_data_for_analysis)
-
-    # Get Chinese explanations for clause text
-    chinese_explanations = await get_chinese_explanation_batch(
-        clause_texts_for_explanation
-    )
-
-    # Build final clause objects
-    clauses = []
-    for i, data in enumerate(clause_data_for_analysis):
-        bilingual = bilingual_analyses[i] if i < len(bilingual_analyses) else {}
-
-        if bilingual.get("_skip"):
-            continue
-
-        analysis_en = bilingual.get(
-            "analysis_en", "This clause has been analyzed for potential concerns."
-        )
-        analysis_zh = bilingual.get("analysis_zh", "该条款已分析潜在问题。")
-        suggestion_en = bilingual.get(
-            "suggestion_en", "Review this clause carefully before signing."
-        )
-        suggestion_zh = bilingual.get("suggestion_zh", "签署前请仔细阅读此条款。")
-
-        clause = {
-            "clause_number": data["clause_number"],
-            "clause_text": data["clause_text"],
-            "category": data["category"],
-            "risk_level": data["risk_level"],
-            "chinese_explanation": chinese_explanations[i]
-            if i < len(chinese_explanations)
-            else "",
-            "analysis_en": analysis_en,
-            "analysis_zh": analysis_zh,
-            "suggestion_en": suggestion_en,
-            "suggestion_zh": suggestion_zh,
-            "analysis": analysis_en,
-            "suggestion": suggestion_en,
-        }
-        clauses.append(clause)
+    # Limit number of clauses based on mode
+    max_clauses = 3 if fast_mode else 10
+    clauses = clauses[:max_clauses]
 
     ai_duration = time.time() - ai_start_time
     return clauses, ai_duration
@@ -648,6 +497,13 @@ async def analyze_lease(
     start_time = time.time()
     temp_image_paths = []
     MAX_PAGES = 40
+
+    if not has_valid_paid_access(user_id):
+        logger.warning(f"Access denied for user_id: {user_id}")
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied. Please purchase the lease analysis service to use this feature.",
+        )
 
     try:
         logger.info(
@@ -715,62 +571,35 @@ async def analyze_lease(
 
         logger.info(f"Extracted {len(full_text)} characters from document")
 
-        raw_summary = await extract_lease_summary_llm(full_text)
-        logger.info(
-            f"[VALIDATE] Raw summary before validation: {json.dumps(raw_summary, indent=2, ensure_ascii=False)}"
-        )
+        # Use the full extraction pipeline from ocr_service
+        lease_data = analyze_lease_via_deepseek(full_text)
 
-        summary = validate_summary_response(raw_summary)
-        logger.info(
-            f"[VALIDATE] Summary after validation: {json.dumps(summary, indent=2, ensure_ascii=False)}"
-        )
+        print("===== ANALYZE ENDPOINT: lease_data received =====", flush=True)
+        print(f"lease_data keys: {list(lease_data.keys())}", flush=True)
+        print(f"clauses count: {len(lease_data.get('clauses', []))}", flush=True)
+        if lease_data.get("clauses"):
+            print(f"first clause: {lease_data['clauses'][0]}", flush=True)
+        print("=================================================", flush=True)
 
-        if summary.get("monthly_rent_amount") or summary.get("lease_start_date"):
-            key_info = build_key_info_from_summary(summary)
-            logger.info(
-                f"[KEY_INFO] Using LLM-based key_info: {json.dumps(key_info, indent=2, ensure_ascii=False)}"
-            )
-        else:
-            key_info = extract_key_info(full_text)
-            logger.info(
-                f"[KEY_INFO] Using regex-based key_info as fallback: {json.dumps(key_info, indent=2, ensure_ascii=False)}"
-            )
+        # Build key_info from lease_data
+        key_info = {
+            "rent": lease_data.get("rent"),
+            "deposit": lease_data.get("deposit"),
+            "term_months": lease_data.get("term_months"),
+            "start_date": lease_data.get("start_date"),
+            "end_date": lease_data.get("end_date"),
+            "landlord": lease_data.get("landlord"),
+            "tenant": lease_data.get("tenant"),
+        }
 
-        all_clauses, ai_duration = await generate_sample_clauses(
-            full_text, fast_mode=False
-        )
+        # Get clauses and summary from lease_data
+        all_clauses = lease_data.get("clauses", [])
+        summary_text = lease_data.get("summary", "")
 
-        # Filter noise and extract high-risk clauses
-        filtered_clauses, high_risk_clauses = filter_and_extract_high_risk_clauses(
-            all_clauses
-        )
-        all_clauses = filtered_clauses
+        # Extract high-risk clauses
+        high_risk_clauses = [c for c in all_clauses if c.get("risk_level") == "high"]
 
-        if settings.should_bypass_test_user(user_id):
-            logger.info(f"Test user bypass enabled for: {user_id}")
-            has_full_access = True
-        else:
-            access_info = check_user_access(user_id)
-            has_full_access = access_info["has_access"]
-
-            if not has_full_access:
-                reason = access_info.get("reason", "expired")
-                if reason == "lease_limit_reached":
-                    return JSONResponse(
-                        status_code=403,
-                        content={
-                            "detail": "ACCESS_DENIED",
-                            "message": f"您已使用完30天通行证中的全部{FULL_ANALYSIS_LEASE_LIMIT}次分析次数。如需继续使用，请购买新的通行证。",
-                        },
-                    )
-                else:
-                    return JSONResponse(
-                        status_code=403,
-                        content={
-                            "detail": "ACCESS_DENIED",
-                            "message": "您当前没有有效的分析权限，请登录或完成支付后再试。",
-                        },
-                    )
+        has_full_access = True  # TEST MODE: always unlocked
 
         processing_time = time.time() - start_time
 
@@ -780,7 +609,7 @@ async def analyze_lease(
         ANALYSIS_STORE[analysis_id] = {
             "full_text": full_text,
             "key_info": key_info,
-            "summary": summary,
+            "summary": summary_text,
             "all_clauses": all_clauses,
             "high_risk_clauses": high_risk_clauses,
             "lines": [
@@ -805,7 +634,7 @@ async def analyze_lease(
 
         timing_info = {
             "backendDuration": round(processing_time * 1000),
-            "llmDuration": round(ai_duration * 1000),
+            "llmDuration": 0,
             "businessDuration": round(processing_time * 1000),
             "totalDuration": round(processing_time, 2),
         }
@@ -816,7 +645,7 @@ async def analyze_lease(
                 "analysis_id": analysis_id,
                 "full_text": full_text,
                 "key_info": key_info,
-                "summary": summary,
+                "summary": summary_text,
                 "clauses": all_clauses,
                 "high_risk_clauses": high_risk_clauses,
                 "total_clauses": len(all_clauses),

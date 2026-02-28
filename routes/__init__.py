@@ -1,3 +1,4 @@
-from routes import lease_routes, billing_routes
+from .lease_routes import router as lease_router
+from .billing_routes import router as billing_router
 
-__all__ = ["lease_routes", "billing_routes"]
+__all__ = ["lease_router", "billing_router"]
