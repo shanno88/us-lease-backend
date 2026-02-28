@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pathlib import Path
 import time
+import pdfplumber
 import logging
 import uuid
 import json
@@ -521,6 +522,7 @@ async def analyze_lease(
         pdf_service = get_pdf_service()
         ocr_service = get_ocr_service()
         all_image_paths = []
+        all_texts = []
 
         sorted_files = sorted(files, key=lambda f: f.filename or "")
 
@@ -530,56 +532,40 @@ async def analyze_lease(
             temp_image_paths.append(uploaded_file_path)
 
             if pdf_service.is_pdf(uploaded_path):
-                logger.info(f"Processing PDF file: {file.filename}")
-                image_paths = pdf_service.pdf_to_images(uploaded_path)
-                all_image_paths.extend(image_paths)
-                temp_image_paths.extend(image_paths)
+                logger.info(f"Processing PDF with pdfplumber: {file.filename}")
+                try:
+                    with pdfplumber.open(uploaded_path) as pdf:
+                        for page in pdf.pages:
+                            text = page.extract_text()
+                            if text:
+                                all_texts.append(text)
+                    logger.info(f"Extracted text from {len(all_texts)} pages via pdfplumber")
+                except Exception as e:
+                    logger.error(f"pdfplumber failed: {e}, falling back to OCR")
+                    image_paths = pdf_service.pdf_to_images(uploaded_path)
+                    all_image_paths.extend(image_paths)
+                    temp_image_paths.extend(image_paths)
             elif pdf_service.is_image(uploaded_path):
                 logger.info(f"Processing image file: {file.filename}")
                 all_image_paths.append(uploaded_path)
             else:
-                logger.error(f"Unsupported file format: {uploaded_path.suffix}")
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported file format: {uploaded_path.suffix}. Please upload PDF or image files.",
-                )
+                raise HTTPException(status_code=400, detail=f"Unsupported file format: {uploaded_path.suffix}")
 
-        if not all_image_paths:
-            logger.error("No pages found in the document(s)")
-            raise HTTPException(
-                status_code=400, detail="No pages found in the document(s)"
-            )
-
-        total_pages = len(all_image_paths)
-        if total_pages > MAX_PAGES:
-            logger.error(f"Too many pages: {total_pages}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Your document has {total_pages} pages, which exceeds our limit of {MAX_PAGES} pages. Please upload a shorter lease or contact support.",
-            )
-
-        logger.info(f"Found {total_pages} page(s) to process from {len(files)} file(s)")
-        ocr_result = ocr_service.recognize_images(all_image_paths)
-
-        if not ocr_result or not ocr_result.get("full_text"):
-            logger.error("OCR returned empty or invalid result")
-            return {
-                "success": False,
-                "error": "No text extracted from document. The document may be empty, contain only images, or have formatting issues.",
-            }
-
-        full_text = ocr_result.get("full_text", "")
+        if all_texts:
+            # PDF text extraction succeeded - skip OCR entirely
+            full_text = "\n\n".join(all_texts)
+            ocr_result = {"lines": [], "page_count": len(all_texts)}
+            logger.info(f"Using pdfplumber text: {len(full_text)} chars")
+        elif all_image_paths:
+            # Image files - use OCR
+            ocr_result = ocr_service.recognize_images(all_image_paths)
+            full_text = ocr_result.get("full_text", "")
+        else:
+            raise HTTPException(status_code=400, detail="No pages found in the document(s)")
 
         if not full_text or not full_text.strip():
-            logger.error("OCR returned empty text")
-            return {
-                "success": False,
-                "error": "No text extracted from document. The document may be empty or contain only images.",
-            }
+            return {"success": False, "error": "No text extracted from document."}
 
-        logger.info(f"Extracted {len(full_text)} characters from document")
-
-        # Use the full extraction pipeline from ocr_service
         lease_data = analyze_lease_via_deepseek(full_text)
 
         print("===== ANALYZE ENDPOINT: lease_data received =====", flush=True)
