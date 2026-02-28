@@ -505,8 +505,8 @@ async def analyze_lease(
     start_time = time.time()
     temp_image_paths = []
 
-    if len(files) > 3:
-        raise HTTPException(status_code=400, detail="Maximum 3 images allowed")
+    if len(files) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 images allowed")
 
     if not await has_valid_paid_access(user_id):
         logger.warning(f"Access denied for user_id: {user_id}")
