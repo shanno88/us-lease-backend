@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any
 import os
 from datetime import datetime, timedelta
 import json
+import asyncpg
 
 from services.paddle import (
     create_checkout,
@@ -12,7 +13,7 @@ from services.paddle import (
     parse_webhook_event,
     PAYMENT_SUCCESS_EVENTS,
 )
-from store import USER_ACCESS_STORE, ANALYSIS_STORE
+from store import ANALYSIS_STORE
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,8 @@ LIVE_PRICE_IDS = {
     "monthly": "pri_LIVE_MONTHLY_PLACEHOLDER",
     "yearly": "pri_LIVE_YEARLY_PLACEHOLDER",
 }
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 def get_plan_from_price_id(price_id: str) -> str:
@@ -47,22 +50,90 @@ def get_subscription_duration(plan: str) -> int:
     return 365
 
 
-def grant_user_access(
+async def get_db_connection() -> asyncpg.Connection:
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is not set")
+    return await asyncpg.connect(DATABASE_URL)
+
+
+async def get_active_subscription(user_id: str) -> Optional[asyncpg.Record]:
+    conn = await get_db_connection()
+    try:
+        row = await conn.fetchrow(
+            '''
+            SELECT "paddlePriceId", "currentPeriodEnd"
+            FROM subscriptions
+            WHERE "userId" = $1
+              AND "currentPeriodEnd" > NOW()
+            ''',
+            user_id,
+        )
+        return row
+    finally:
+        await conn.close()
+
+
+def get_analyses_count_for_user(user_id: str) -> int:
+    count = 0
+    for analysis in ANALYSIS_STORE.values():
+        if isinstance(analysis, dict) and analysis.get("user_id") == user_id:
+            count += 1
+    return count
+
+
+async def grant_user_access(
     user_id: str,
     plan: str,
     customer_email: Optional[str] = None,
     transaction_id: Optional[str] = None,
     subscription_id: Optional[str] = None,
+    price_id: Optional[str] = None,
+    paddle_customer_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = datetime.now()
     duration_days = get_subscription_duration(plan)
-    expires_at = (now + timedelta(days=duration_days)).isoformat()
+    expires_at_dt = now + timedelta(days=duration_days)
 
-    existing_analysis_ids = []
-    if user_id in USER_ACCESS_STORE:
-        existing_analysis_ids = USER_ACCESS_STORE[user_id].get("analysis_ids", [])
+    conn = await get_db_connection()
+    try:
+        email_value = customer_email or user_id
 
-    USER_ACCESS_STORE[user_id] = {
+        await conn.execute(
+            '''
+            INSERT INTO "user" (id, email, name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (id) DO NOTHING
+            ''',
+            user_id,
+            email_value,
+            None,
+        )
+
+        await conn.execute(
+            '''
+            INSERT INTO subscriptions ("userId", "paddleSubscriptionId", "paddleCustomerId", "paddlePriceId", "currentPeriodEnd")
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT ("userId") DO UPDATE
+            SET "paddleSubscriptionId" = EXCLUDED."paddleSubscriptionId",
+                "paddleCustomerId" = EXCLUDED."paddleCustomerId",
+                "paddlePriceId" = EXCLUDED."paddlePriceId",
+                "currentPeriodEnd" = EXCLUDED."currentPeriodEnd"
+            ''',
+            user_id,
+            subscription_id,
+            paddle_customer_id,
+            price_id,
+            expires_at_dt,
+        )
+    finally:
+        await conn.close()
+
+    expires_at = expires_at_dt.isoformat()
+
+    logger.info(
+        f"[ACCESS GRANTED] user_id={user_id}, plan={plan}, expires_at={expires_at}"
+    )
+    return {
         "is_paid": True,
         "plan": plan,
         "paid_at": now.isoformat(),
@@ -70,13 +141,8 @@ def grant_user_access(
         "customer_email": customer_email,
         "transaction_id": transaction_id,
         "subscription_id": subscription_id,
-        "analysis_ids": existing_analysis_ids,
+        "analysis_ids": [],
     }
-
-    logger.info(
-        f"[ACCESS GRANTED] user_id={user_id}, plan={plan}, expires_at={expires_at}"
-    )
-    return USER_ACCESS_STORE[user_id]
 
 
 class CreateCheckoutRequest(BaseModel):
@@ -131,7 +197,7 @@ async def grant_access_direct(request: GrantAccessRequest):
     if request.price_id:
         plan = get_plan_from_price_id(request.price_id)
 
-    access = grant_user_access(
+    access = await grant_user_access(
         user_id=request.user_id,
         plan=plan,
         customer_email=request.customer_email,
@@ -151,22 +217,18 @@ async def create_checkout_session(request: CreateCheckoutRequest):
     try:
         logger.info(f"Creating checkout for user_id: {request.user_id}")
 
-        # Check if user already has valid access
-        now = datetime.now()
-        if request.user_id in USER_ACCESS_STORE:
-            access = USER_ACCESS_STORE[request.user_id]
-            if "expires_at" in access:
-                expires_at = datetime.fromisoformat(access["expires_at"])
-                if now < expires_at:
-                    logger.info(
-                        f"User {request.user_id} already has valid access until {expires_at}"
-                    )
-                    return CheckoutResponse(
-                        success=True,
-                        checkout_url=None,
-                        transaction_id=None,
-                        error=None,
-                    )
+        # Check if user already has valid access in subscriptions table
+        active_subscription = await get_active_subscription(request.user_id)
+        if active_subscription:
+            logger.info(
+                f"User {request.user_id} already has valid access via active subscription"
+            )
+            return CheckoutResponse(
+                success=True,
+                checkout_url=None,
+                transaction_id=None,
+                error=None,
+            )
 
         # Create Paddle checkout with user_id in metadata
         result = await create_checkout_for_user(request.user_id)
@@ -292,9 +354,11 @@ async def paddle_webhook(
         logger.info(f"[WEBHOOK] user_id from custom_data: {user_id}")
 
         customer_email = None
+        paddle_customer_id = None
         customer_obj = data.get("customer", {})
         if customer_obj:
             customer_email = customer_obj.get("email")
+            paddle_customer_id = customer_obj.get("id")
             logger.info(
                 f"[WEBHOOK] customer_email from data.customer.email: {customer_email}"
             )
@@ -349,12 +413,14 @@ async def paddle_webhook(
                 plan = get_plan_from_price_id(price_id)
             logger.info(f"[WEBHOOK] Determined plan: {plan}")
 
-            grant_user_access(
+            await grant_user_access(
                 user_id=user_id,
                 plan=plan,
                 customer_email=customer_email,
                 transaction_id=transaction_id,
                 subscription_id=subscription_id,
+                price_id=price_id,
+                paddle_customer_id=paddle_customer_id,
             )
 
             if transaction_id and transaction_id in PENDING_PAYMENTS:
@@ -390,7 +456,9 @@ async def check_user_access(
     user_id: str = Query(..., description="User ID from frontend session"),
 ):
     try:
-        if user_id not in USER_ACCESS_STORE:
+        row = await get_active_subscription(user_id)
+
+        if not row:
             return {
                 "success": True,
                 "has_access": False,
@@ -398,46 +466,36 @@ async def check_user_access(
                 "plan": None,
                 "expires_at": None,
                 "days_remaining": 0,
-                "analyses_count": 0,
+                "analyses_count": get_analyses_count_for_user(user_id),
             }
 
-        access = USER_ACCESS_STORE[user_id]
+        price_id = row.get("paddlePriceId")
+        current_period_end = row.get("currentPeriodEnd")
+        plan = get_plan_from_price_id(price_id) if price_id else None
+
         now = datetime.now()
 
-        if "expires_at" not in access:
-            return {
-                "success": True,
-                "has_access": False,
-                "is_paid": access.get("is_paid", False),
-                "plan": access.get("plan"),
-                "expires_at": None,
-                "days_remaining": 0,
-                "analyses_count": len(access.get("analysis_ids", [])),
-            }
-
-        expires_at = datetime.fromisoformat(access["expires_at"])
-
-        if now < expires_at:
-            days_remaining = (expires_at - now).days
+        if current_period_end and current_period_end > now:
+            days_remaining = (current_period_end - now).days
             return {
                 "success": True,
                 "has_access": True,
                 "is_paid": True,
-                "plan": access.get("plan", "yearly"),
-                "expires_at": access["expires_at"],
+                "plan": plan or "yearly",
+                "expires_at": current_period_end.isoformat(),
                 "days_remaining": days_remaining,
-                "analyses_count": len(access.get("analysis_ids", [])),
+                "analyses_count": get_analyses_count_for_user(user_id),
             }
-        else:
-            return {
-                "success": True,
-                "has_access": False,
-                "is_paid": False,
-                "plan": access.get("plan"),
-                "expires_at": access["expires_at"],
-                "days_remaining": 0,
-                "analyses_count": len(access.get("analysis_ids", [])),
-            }
+
+        return {
+            "success": True,
+            "has_access": False,
+            "is_paid": False,
+            "plan": plan,
+            "expires_at": current_period_end.isoformat() if current_period_end else None,
+            "days_remaining": 0,
+            "analyses_count": get_analyses_count_for_user(user_id),
+        }
 
     except Exception as e:
         logger.exception(f"Error checking access: {str(e)}")
@@ -459,21 +517,9 @@ async def check_payment_status(analysis_id: str):
                 "paid": False,
             }
 
-        if user_id not in USER_ACCESS_STORE:
-            return {
-                "success": True,
-                "analysis_id": analysis_id,
-                "paid": False,
-            }
+        row = await get_active_subscription(user_id)
 
-        access = USER_ACCESS_STORE[user_id]
-        now = datetime.now()
-
-        if "expires_at" in access:
-            expires_at = datetime.fromisoformat(access["expires_at"])
-            is_paid = now < expires_at
-        else:
-            is_paid = False
+        is_paid = bool(row)
 
         return {
             "success": True,
