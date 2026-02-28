@@ -42,14 +42,22 @@ router = APIRouter(tags=["lease"])
 _deepseek_client = None
 
 
-def has_valid_paid_access(user_id: str) -> bool:
-    if user_id not in USER_ACCESS_STORE:
+async def has_valid_paid_access(user_id: str) -> bool:
+    import asyncpg
+    import os
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
         return False
-    access = USER_ACCESS_STORE[user_id]
-    if "expires_at" not in access:
+    try:
+        conn = await asyncpg.connect(database_url)
+        row = await conn.fetchrow(
+            'SELECT "userId" FROM subscriptions WHERE "userId" = $1 AND "currentPeriodEnd" > NOW()',
+            user_id
+        )
+        await conn.close()
+        return row is not None
+    except Exception:
         return False
-    expires_at = datetime.fromisoformat(access["expires_at"])
-    return datetime.now() < expires_at
 
 
 def get_deepseek_client() -> OpenAI:
@@ -498,7 +506,7 @@ async def analyze_lease(
     temp_image_paths = []
     MAX_PAGES = 40
 
-    if not has_valid_paid_access(user_id):
+    if not await has_valid_paid_access(user_id):
         logger.warning(f"Access denied for user_id: {user_id}")
         raise HTTPException(
             status_code=403,
